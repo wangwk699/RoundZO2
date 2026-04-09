@@ -187,7 +187,7 @@ def evaluate(lm, args, logger):
 
 def main():
     import argparse
-
+    start_time = time.time()  # 记录开始时间    
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, help="model name of model path")
     parser.add_argument("--cache_dir", default="./cache", type=str, help="cache dir of dataset, leading to faster debug")
@@ -368,6 +368,17 @@ def main():
         lm.model.save_pretrained(args.save_dir)  
         lm.tokenizer.save_pretrained(args.save_dir) 
     evaluate(lm, args,logger)
+    
+    # 【新增】记录执行时间并输出到日志
+    end_time = time.time()
+    execution_time = end_time - start_time
+    hours = int(execution_time // 3600)
+    minutes = int((execution_time % 3600) // 60)
+    seconds = execution_time % 60
+    logger.info(f"\n===== Execution Time =====")
+    logger.info(f"Total: {execution_time:.2f} seconds")
+    logger.info(f"Format: {hours}h {minutes}m {seconds:.2f}s")
+    logger.info(f"==========================")
 
 
 if __name__ == "__main__":
