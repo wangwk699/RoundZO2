@@ -139,11 +139,11 @@ class QuantLlama3DecoderLayer(nn.Module):
                  args):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = QuantLlamaAttention(
+        self.self_attn = QuantLlama3Attention(
             org_module=ori_layer.self_attn,
             config=config,
             args=args)
-        self.mlp = QuantLlamaMLP(
+        self.mlp = QuantLlama3MLP(
             org_module=ori_layer.mlp,
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,

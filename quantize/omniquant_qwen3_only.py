@@ -1,5 +1,11 @@
 import torch
 import torch.nn as nn
+from models.int_qwen_layer import QuantQwenDecoderLayer
+from models.int_qwen3_layer import QuantQwen3DecoderLayer
+from models.int_llama_layer import QuantLlamaDecoderLayer
+from models.int_opt_layer import QuantOPTDecoderLayer
+from models.int_falcon_layer import QuantFalconDecoderLayer
+from quantize.int_linear import QuantLinear
 from contextlib import nullcontext
 import copy
 import math
@@ -8,14 +14,6 @@ import os
 import pdb
 import gc
 
-from models.int_qwen_layer import QuantQwenDecoderLayer
-from models.int_qwen3_layer import QuantQwen3DecoderLayer
-from models.int_llama_layer import QuantLlamaDecoderLayer
-from models.int_llama3_layer import QuantLlama3DecoderLayer
-from models.int_opt_layer import QuantOPTDecoderLayer
-from models.int_falcon_layer import QuantFalconDecoderLayer
-
-from quantize.int_linear import QuantLinear
 from quantize.utils import (
     let_parameters,
     lwc_parameters,
@@ -28,7 +26,7 @@ from quantize.utils import (
     set_quant_state,
 )
 
-# Qwen3 needs per-layer mask mapping
+# Qwen3 mask helpers
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
 try:
@@ -72,27 +70,16 @@ def omniquant(
     model.config.use_cache = False
 
     is_llama = False
-    is_llama3 = False
     is_qwen = False
     is_qwen2 = False
     is_qwen3 = False
 
-    net_name = args.net.lower()
-
-    if "llama" in net_name:
+    if "llama" in args.net.lower():
         is_llama = True
         layers = model.model.layers
         model.model.embed_tokens = model.model.embed_tokens.to(dev)
         model.model.norm = model.model.norm.to(dev)
-
-        # llama3 uses the new v4.57.6 style decoder interface:
-        # shared causal_mask + shared position_embeddings
-        if "llama-3" in net_name or "llama3" in net_name:
-            is_llama3 = True
-            DecoderLayer = QuantLlama3DecoderLayer
-        else:
-            DecoderLayer = QuantLlamaDecoderLayer
-
+        DecoderLayer = QuantLlamaDecoderLayer
         pairs = {
             "q_proj": "qkv",
             "o_proj": "out",
@@ -100,13 +87,13 @@ def omniquant(
         }
         layer_name_prefix = "model.layers"
 
-    elif "qwen" in net_name:
+    elif "qwen" in args.net.lower():
         is_qwen = True
         layers = model.model.layers
         model.model.embed_tokens = model.model.embed_tokens.to(dev)
         model.model.norm = model.model.norm.to(dev)
 
-        if "qwen2" in net_name:
+        if "qwen2" in args.net.lower():
             is_qwen2 = True
             DecoderLayer = QuantQwenDecoderLayer
         else:
@@ -120,7 +107,7 @@ def omniquant(
         }
         layer_name_prefix = "model.layers"
 
-    elif "opt" in net_name:
+    elif "opt" in args.net.lower():
         layers = model.model.decoder.layers
         model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(dev)
         model.model.decoder.embed_positions = model.model.decoder.embed_positions.to(dev)
@@ -136,7 +123,7 @@ def omniquant(
         }
         layer_name_prefix = "model.decoder.layers"
 
-    elif "falcon" in net_name:
+    elif "falcon" in args.net.lower():
         layers = model.transformer.h
         model.transformer.word_embeddings.to(dev)
         model.transformer.ln_f.to(dev)
@@ -144,7 +131,7 @@ def omniquant(
         DecoderLayer = QuantFalconDecoderLayer
         layer_name_prefix = "model.transformer.h"
 
-    elif "mixtral" in net_name:
+    elif "mixtral" in args.net.lower():
         is_llama = True
         layers = model.model.layers
         model.model.embed_tokens = model.model.embed_tokens.to(dev)
@@ -152,7 +139,7 @@ def omniquant(
         layer_name_prefix = "model.layers"
 
     else:
-        raise ValueError("Only support for opt/llama/llama3/Llama-2/falcon/mixtral/qwen2/qwen3 now")
+        raise ValueError("Only support for opt/llama/Llama-2/falcon/mixtral/qwen2/qwen3 now")
 
     layers[0] = layers[0].to(dev)
 
@@ -168,28 +155,26 @@ def omniquant(
         dtype=dtype,
         device=dev,
     )
-
     cache = {"i": 0}
 
-    # Shared path for old llama / llama3 / qwen2
+    # non-Qwen3 path
     attention_mask = None
     attention_mask_batch = None
     position_ids = None
-    position_embeddings = None
 
-    # Qwen3 only
+    # Qwen3 path
     attention_mask_mapping = None
+    position_embeddings = None
 
     class Catcher(nn.Module):
         def __init__(self, module):
             super().__init__()
             self.module = module
             self.is_llama = False
-            self.is_llama3 = False
             self.is_qwen2 = False
             self.is_qwen3 = False
 
-            # Qwen3Model.forward reads decoder_layer.attention_type before calling the layer
+            # Qwen3Model.forward 会先访问 decoder_layer.attention_type
             if hasattr(module, "attention_type"):
                 self.attention_type = module.attention_type
 
@@ -203,15 +188,7 @@ def omniquant(
             inps[cache["i"]] = inp
             cache["i"] += 1
 
-            if self.is_llama3:
-                if "attention_mask" in kwargs:
-                    cache["attention_mask"] = kwargs["attention_mask"]
-                if "position_embeddings" in kwargs:
-                    cache["position_embeddings"] = kwargs["position_embeddings"]
-                if "position_ids" in kwargs:
-                    cache["position_ids"] = kwargs["position_ids"]
-
-            elif self.is_llama:
+            if self.is_llama:
                 if "attention_mask" in kwargs:
                     cache["attention_mask"] = kwargs["attention_mask"]
                 if "position_ids" in kwargs:
@@ -224,8 +201,6 @@ def omniquant(
                     cache["position_ids"] = kwargs["position_ids"]
 
             elif self.is_qwen3:
-                # Qwen3 first layer only sees the selected mask for its own attention_type,
-                # so the full mapping is built outside and position_embeddings are cached here.
                 if "position_embeddings" in kwargs:
                     cache["position_embeddings"] = kwargs["position_embeddings"]
                 if "position_ids" in kwargs:
@@ -234,8 +209,7 @@ def omniquant(
             raise ValueError
 
     layers[0] = Catcher(layers[0])
-    layers[0].is_llama = is_llama and not is_llama3
-    layers[0].is_llama3 = is_llama3
+    layers[0].is_llama = is_llama
     layers[0].is_qwen2 = is_qwen2
     layers[0].is_qwen3 = is_qwen3
 
@@ -248,7 +222,7 @@ def omniquant(
 
             try:
                 if is_qwen3:
-                    # Qwen3: build the full mask mapping once, because each layer may use a different mask
+                    # 只构造一次，后续所有层共享同一份 mapping / position_embeddings
                     if attention_mask_mapping is None:
                         inputs_embeds = model.model.embed_tokens(input_ids)
 
@@ -279,28 +253,26 @@ def omniquant(
 
                         position_embeddings = model.model.rotary_emb(inputs_embeds, position_ids)
 
+                    # 这里传 mapping，Qwen3Model.forward 会按 decoder_layer.attention_type 取值
                     model(
                         input_ids=input_ids,
                         attention_mask=attention_mask_mapping,
                         position_ids=position_ids,
                     )
-
                 else:
-                    # old llama / llama3 / qwen2 / others:
-                    # let the HF model build its own mask and pass it into layer 0, then Catcher caches it
                     model(input_ids)
 
             except ValueError:
                 pass
 
-    # restore the first layer
+    # restore first layer
     layers[0] = layers[0].module
     layers[0] = layers[0].cpu()
 
-    if "llama" in net_name or "qwen" in net_name:
+    if "llama" in args.net.lower() or "qwen" in args.net.lower():
         model.model.embed_tokens = model.model.embed_tokens.cpu()
         model.model.norm = model.model.norm.cpu()
-    elif "opt" in net_name:
+    elif "opt" in args.net.lower():
         model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.cpu()
         model.model.decoder.embed_positions = model.model.decoder.embed_positions.cpu()
         if hasattr(model.model.decoder, "project_out") and model.model.decoder.project_out:
@@ -310,7 +282,7 @@ def omniquant(
     elif "falcon" in args.model:
         model.transformer.word_embeddings = model.transformer.word_embeddings.cpu()
     else:
-        raise ValueError("Only support for opt/llama/llama3/Llama-2/falcon/mixtral/qwen2/qwen3 now")
+        raise ValueError("Only support for opt/llama/Llama-2/falcon/mixtral/qwen2/qwen3 now")
 
     torch.cuda.empty_cache()
 
@@ -320,25 +292,7 @@ def omniquant(
 
     loss_func = torch.nn.MSELoss()
 
-    if is_llama3:
-        attention_mask = cache.get("attention_mask", None)
-        position_embeddings = cache.get("position_embeddings", None)
-        position_ids = cache.get("position_ids", None)
-
-        if attention_mask is not None:
-            attention_mask_batch = (
-                attention_mask.repeat(args.batch_size, 1, 1, 1)
-                if args.deactive_amp
-                else attention_mask.repeat(args.batch_size, 1, 1, 1).float()
-            )
-        else:
-            logger.info(
-                "No attention mask caught from the first layer."
-                " Seems that model's attention works without a mask."
-            )
-            attention_mask_batch = None
-
-    elif is_llama or is_qwen2:
+    if is_llama or is_qwen2:
         attention_mask = cache.get("attention_mask", None)
         position_ids = cache.get("position_ids", None)
 
@@ -371,7 +325,7 @@ def omniquant(
         logger.info(f"=== Start quantize layer {i} ===")
         layer = layers[i].to(dev)
 
-        if "mixtral" in net_name:
+        if "mixtral" in args.net.lower():
             qlayer = copy.deepcopy(layer)
             for name, module in qlayer.named_modules():
                 if isinstance(module, torch.nn.Linear) and "gate" not in name:
@@ -382,21 +336,21 @@ def omniquant(
 
         qlayer = qlayer.to(dev)
 
-        # current layer attention mask
+        # 选当前层自己的 attention mask
         if is_qwen3:
             layer_attention_mask = attention_mask_mapping[qlayer.attention_type]
         else:
             layer_attention_mask = attention_mask
             layer_attention_mask_batch = attention_mask_batch
 
-        # obtain full-precision outputs
+        # obtain output of full-precision model
         set_quant_state(qlayer, weight_quant=False, act_quant=False)
 
         if args.epochs > 0:
             with torch.no_grad():
                 with torch.amp.autocast("cuda"):
                     for j in range(args.nsamples):
-                        if is_qwen3 or is_llama3:
+                        if is_qwen3:
                             fp_inps[j] = qlayer(
                                 fp_inps[j].unsqueeze(0),
                                 attention_mask=layer_attention_mask,
@@ -500,23 +454,13 @@ def omniquant(
 
                     with traincast():
                         if is_qwen3:
-                            # qwen3 keeps a single per-layer mask and relies on broadcast
+                            # 精简版：Qwen3 直接复用 batch=1 的 mask，依赖广播
                             smooth_and_quant_temporary(qlayer, args, True)
                             quant_out = qlayer(
                                 quant_inps[index:index + args.batch_size],
                                 attention_mask=layer_attention_mask,
                                 position_embeddings=position_embeddings,
                             )
-
-                        elif is_llama3:
-                            # llama3 uses the same causal mask for all layers
-                            smooth_and_quant_temporary(qlayer, args, True)
-                            quant_out = qlayer(
-                                quant_inps[index:index + args.batch_size],
-                                attention_mask=layer_attention_mask_batch,
-                                position_embeddings=position_embeddings,
-                            )
-
                         else:
                             is_llama_qwen = is_llama or is_qwen
                             smooth_and_quant_temporary(qlayer, args, is_llama_qwen)
@@ -562,7 +506,7 @@ def omniquant(
             with torch.no_grad():
                 with traincast():
                     for j in range(args.nsamples):
-                        if is_qwen3 or is_llama3:
+                        if is_qwen3:
                             quant_inps[j] = qlayer(
                                 quant_inps[j].unsqueeze(0),
                                 attention_mask=layer_attention_mask,
