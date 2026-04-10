@@ -17,4 +17,10 @@ pre_quantized_models/
 result/
 wang.sh
 llama.sh
+llama1.sh
+llama2.sh
+llama3.sh
 qwen.sh
+qwen1.sh
+qwen2.sh
+qwen3.sh
